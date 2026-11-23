@@ -24,9 +24,43 @@ const BASE_10 = 10
 var (
 	RFC3339WithoutTimezone = "2006-01-02T15:04:05"
 
-	ErrInvalidJob       = errors.New("Invalid Local Job. Job's must contain a Name and a Command field")
-	ErrInvalidRemoteJob = errors.New("Invalid Remote Job. Job's must contain a Name and a url field")
-	ErrInvalidJobType   = errors.New("Invalid Job type. Types supported: 0 for local and 1 for remote")
+	ErrInvalidJob             = errors.New("Invalid Local Job. Job's must contain a Name and a Command field")
+	ErrInvalidRemoteJob       = errors.New("Invalid Remote Job. Job's must contain a Name and a url field")
+	ErrInvalidJobType         = errors.New("Invalid Job type. Types supported: 0 for local and 1 for remote")
+	ErrInvalidMissedRunPolicy = errors.New("Invalid missed_run_policy. Supported: \"\" (legacy), \"none\", \"catch_up\"")
+	ErrInvalidMaxMissedRuns   = errors.New("Invalid max_missed_runs. It must not be negative")
+)
+
+// MissedRunPolicy decides what happens to schedule points that were missed
+// while Kala was not running (restart) or while the job was disabled.
+type MissedRunPolicy string
+
+const (
+	// MissedRunPolicyUnset keeps the legacy behavior: ResumeAtNextScheduledTime
+	// decides. When that boolean is false, a single missed run is caught up.
+	MissedRunPolicyUnset MissedRunPolicy = ""
+	// MissedRunPolicyNone never catches up; the job waits for future points.
+	MissedRunPolicyNone MissedRunPolicy = "none"
+	// MissedRunPolicyCatchUp catches up missed points, oldest first, up to
+	// MaxMissedRuns (default 1).
+	MissedRunPolicyCatchUp MissedRunPolicy = "catch_up"
+)
+
+// RunTrigger records what caused a run, so normal and compensating runs can
+// be told apart in job stats.
+type RunTrigger string
+
+const (
+	// TriggerNormal is any run without a more specific trigger.
+	TriggerNormal RunTrigger = ""
+	// TriggerScheduled is a run fired by the job's own schedule timer.
+	TriggerScheduled RunTrigger = "scheduled"
+	// TriggerCatchUp is a compensating run after downtime.
+	TriggerCatchUp RunTrigger = "catch_up"
+	// TriggerManual is a run started through the API.
+	TriggerManual RunTrigger = "manual"
+	// TriggerDependency is a run caused by a parent job finishing.
+	TriggerDependency RunTrigger = "dependency"
 )
 
 type Job struct {
@@ -75,6 +109,10 @@ type Job struct {
 	jobTimer  clock.Timer
 	NextRunAt time.Time `json:"next_run_at"`
 
+	// nextScheduledPoint is the schedule point the armed timer is meant to
+	// consume. It is an internal detail; it is not persisted.
+	nextScheduledPoint time.Time
+
 	// Templating delimiters, the left & right separated by space,
 	// for example `{{ }}` or `${ }`.
 	//
@@ -94,7 +132,21 @@ type Job struct {
 	// normally the job will run immediately.
 	// With this setting on, it will not run immediately, but will wait
 	// until the next scheduled run time comes along.
+	//
+	// This is the legacy spelling of MissedRunPolicy "none". When
+	// MissedRunPolicy is set explicitly it takes precedence.
 	ResumeAtNextScheduledTime bool `json:"resume_at_next_scheduled_time"`
+
+	// MissedRunPolicy decides what happens to schedule points that were
+	// missed while Kala was down or the job was disabled.
+	//
+	// The zero value is valid and means "use the legacy behavior", which is
+	// to catch up a single missed run and then resume the normal cadence.
+	MissedRunPolicy MissedRunPolicy `json:"missed_run_policy,omitempty"`
+
+	// MaxMissedRuns bounds the number of catch-up runs for
+	// MissedRunPolicy "catch_up". Values below one behave like one.
+	MaxMissedRuns int `json:"max_missed_runs,omitempty"`
 
 	// Meta data about successful and failed runs.
 	Metadata Metadata `json:"metadata"`
@@ -108,11 +160,27 @@ type Job struct {
 	// Collection of Job Stats
 	Stats []*JobStat `json:"stats"`
 
+	// LastScheduledRunPoint is the most recent schedule point that the
+	// scheduler itself has consumed and completed. It is advanced only by
+	// schedule-driven runs (normal timers and catch-up runs), never by
+	// manual starts or dependency-triggered runs. That keeps the two
+	// trigger sources distinguishable when a job has both a parent and a
+	// schedule.
+	//
+	// It is persisted after each completed run, so a restart resumes from
+	// the last completed point instead of recomputing the whole window.
+	LastScheduledRunPoint time.Time `json:"last_scheduled_run_point,omitempty"`
+
 	lock sync.RWMutex
 
 	// Says if a job has been executed right numbers of time
 	// and should not been executed again in the future
 	IsDone bool `json:"is_done"`
+
+	// catchUpInProgress is set while a recovery catch-up sequence is
+	// running for this job. While set, completed runs do not arm a normal
+	// timer; the catch-up loop decides when normal scheduling resumes.
+	catchUpInProgress bool
 
 	// The job will send on this channel when it's done running; used for tests.
 	// Note that if the job should be rescheduled, it will send on this channel
@@ -156,6 +224,47 @@ type Metadata struct {
 	LastError            time.Time `json:"last_error"`
 	LastAttemptedRun     time.Time `json:"last_attempted_run"`
 	NumberOfFinishedRuns uint      `json:"number_of_finished_runs"`
+
+	// ScheduledRuns is the number of completed schedule-driven runs (normal
+	// or catch-up). It is counted independently of Stats, so jobstat-ttl
+	// truncation cannot make a finite job run again, and it is not increased
+	// by manual starts, dependency runs, or retries inside a single run.
+	ScheduledRuns uint `json:"scheduled_runs,omitempty"`
+	// CatchUpRuns is how many catch-up runs this episode has executed. It is
+	// persisted after every run, so an interrupted episode continues where
+	// it stopped instead of recomputing the whole outage.
+	CatchUpRuns uint `json:"catch_up_runs,omitempty"`
+	// CatchUpPlanned is the budget this episode is allowed: the number of
+	// catch-up runs planned when the episode started. Zero means no episode
+	// is in progress.
+	CatchUpPlanned uint `json:"catch_up_planned,omitempty"`
+	// NextOnGrid asks the next normal timer to snap to the schedule grid
+	// (the first point strictly after now) instead of the legacy
+	// "last attempt + interval" cadence. It is set when a recovery episode
+	// or a skipped window ends, and cleared once the timer is armed.
+	NextOnGrid bool `json:"next_on_grid,omitempty"`
+	// LastCatchUpResult is the outcome of the most recent catch-up
+	// sequence: how many runs were due, how many were executed, and
+	// whether the cap truncated them. It is replaced, never appended.
+	LastCatchUpResult *CatchUpResult `json:"last_catch_up_result,omitempty"`
+}
+
+// CatchUpResult records the outcome of the most recent catch-up sequence.
+type CatchUpResult struct {
+	// StartedAt is when the recovery pass began.
+	StartedAt time.Time `json:"started_at"`
+	// MissedPoints is how many schedule points had passed when recovery
+	// began, without the cap applied.
+	MissedPoints int `json:"missed_points"`
+	// Planned is how many catch-up runs the policy and cap allowed.
+	Planned int `json:"planned"`
+	// Executed is how many catch-up runs actually completed.
+	Executed int `json:"executed"`
+	// Truncated is true when Planned < MissedPoints, i.e. the cap (or the
+	// policy) discarded missed points.
+	Truncated bool `json:"truncated"`
+	// NextScheduledPoint is the next normal schedule point after recovery.
+	NextScheduledPoint time.Time `json:"next_scheduled_point"`
 }
 
 // Bytes returns the byte representation of the Job.
@@ -200,6 +309,9 @@ func (j *Job) Init(cache JobCache) error {
 	if err != nil {
 		return err
 	}
+	if err := j.validateMissedRunPolicy(); err != nil {
+		return err
+	}
 
 	u4, err := uuid.NewV4()
 	if err != nil {
@@ -239,7 +351,7 @@ func (j *Job) Init(cache JobCache) error {
 	// TODO: Delete from cache after running.
 	if j.Schedule == "" {
 		// If schedule is empty, its a one-off job.
-		go j.Run(cache)
+		go j.run(cache, TriggerNormal, time.Time{}, false)
 		return nil
 	}
 
@@ -338,19 +450,57 @@ func (j *Job) InitDelayDuration(checkTime bool) error {
 
 // StartWaiting begins a timer for when it should execute the Jobs .Run() method.
 func (j *Job) StartWaiting(cache JobCache, justRan bool) {
-	waitDuration := j.GetWaitDuration()
+	j.startWaiting(cache, justRan, false)
+}
 
+// startWaiting arms the next normal schedule timer. It never compensates
+// missed runs; callers that need compensation call runCatchUpEpisode.
+//
+// It is idempotent for the same plan point: arming the same (job, point)
+// twice is refused, which prevents two timers for one persistent point.
+func (j *Job) startWaiting(cache JobCache, justRan, force bool) {
 	j.lock.Lock()
-	defer j.lock.Unlock()
+
+	if j.Disabled {
+		j.lock.Unlock()
+		return
+	}
+	now := j.clk.Time().Now()
+	alignToGrid := j.Metadata.NextOnGrid
+	point, waitDuration, ok := j.normalWaitLocked(now, alignToGrid)
+	if !ok {
+		j.lock.Unlock()
+		if justRan && j.ranChan != nil {
+			j.ranChan <- struct{}{}
+		}
+		return
+	}
+
+	if !force && j.jobTimer != nil && j.NextRunAt.After(now) &&
+		!j.nextScheduledPoint.IsZero() && j.nextScheduledPoint.Equal(point) {
+		// A timer for this exact point is already pending; do not create a
+		// second one for the same persistent point.
+		j.lock.Unlock()
+		return
+	}
 
 	log.Infof("Job %s:%s repeating in %s", j.Name, j.Id, waitDuration)
 
-	j.NextRunAt = j.clk.Time().Now().Add(waitDuration)
+	j.NextRunAt = now.Add(waitDuration)
+	j.nextScheduledPoint = point
+	j.Metadata.NextOnGrid = false
 
-	jobRun := func() { j.Run(cache) }
+	// Replace any previous timer so a job never has two live timers.
+	stale := j.jobTimer
+	jobRun := func() { j.runScheduled(cache, point) }
 	j.jobTimer = j.clk.Time().AfterFunc(waitDuration, jobRun)
+	ran := justRan && j.ranChan != nil
+	j.lock.Unlock()
 
-	if justRan && j.ranChan != nil {
+	if stale != nil {
+		stale.Stop()
+	}
+	if ran {
 		j.ranChan <- struct{}{}
 	}
 }
@@ -491,21 +641,37 @@ func (j *Job) RunOnFailureJob(cache JobCache) {
 		if cacheErr == ErrJobDoesntExist {
 			log.Errorf("Error retrieving dependent job with id of %s", j.OnFailureJob)
 		} else {
-			onFailureJob.Run(cache)
+			onFailureJob.run(cache, TriggerDependency, time.Time{}, false)
 		}
 	}
 }
 
+// Run executes the job without a schedule point. It is used for manual starts.
 func (j *Job) Run(cache JobCache) {
+	j.run(cache, TriggerManual, time.Time{}, false)
+}
 
+// runScheduled is the timer callback: it consumes the schedule point the
+// timer was armed for.
+func (j *Job) runScheduled(cache JobCache, point time.Time) {
+	j.run(cache, TriggerScheduled, point, true)
+}
+
+// run executes the job and reports whether a run actually happened. scheduled
+// tells whether this run consumes a schedule point; point is that point (a zero
+// value means "the next outstanding point").
+func (j *Job) run(cache JobCache, trigger RunTrigger, point time.Time, scheduled bool) bool {
 	_, err := cache.Get(j.Id)
 	if errors.Is(err, ErrJobDoesntExist) {
 		log.Infof("Job %s with id %s tried to run, but exited early because it has been deleted", j.Name, j.Id)
-		return
+		return false
 	}
 
 	j.lock.RLock()
-	jobRunner := &JobRunner{job: j, meta: j.Metadata}
+	jobRunner := &JobRunner{job: j, meta: j.Metadata, trigger: trigger, scheduledPoint: point}
+	// Capture legacy evidence before the run so seeding the independent
+	// counter does not count this run from its own post-run metadata.
+	legacyDoneBeforeRun := j.planRunsDoneLocked()
 	j.lock.RUnlock()
 
 	newStat, newMeta, err := jobRunner.Run(cache)
@@ -514,43 +680,77 @@ func (j *Job) Run(cache JobCache) {
 		j.RunOnFailureJob(cache)
 		j.lock.RUnlock()
 	}
+	executed := newStat != nil
 
 	j.lock.Lock()
 	j.Metadata = newMeta
+	if scheduled && executed {
+		// Seed the independent counter from legacy evidence before the first
+		// increment; otherwise a job upgraded from old data would forget the
+		// runs it already did and could run past its plan.
+		if j.Metadata.ScheduledRuns == 0 {
+			j.Metadata.ScheduledRuns = uint(legacyDoneBeforeRun)
+		}
+		j.Metadata.ScheduledRuns++
+		if jobRunner.trigger == TriggerCatchUp {
+			j.Metadata.CatchUpRuns++
+		}
+		consumed := point
+		if consumed.IsZero() {
+			if oldest, ok := j.nextOutstandingPointLocked(j.clk.Time().Now()); ok {
+				consumed = oldest
+			}
+		}
+		if !consumed.IsZero() && consumed.After(j.LastScheduledRunPoint) {
+			j.LastScheduledRunPoint = consumed
+		}
+	}
 	if newStat != nil {
 		j.Stats = append(j.Stats, newStat)
 	}
 
-	// Kinda annoying and inefficient that it needs to be done this way.
-	// Some refactoring is probably in order.
-
+	resuming := j.catchUpInProgress
 	j.lock.Unlock()
-	j.lock.RLock()
-	if err := cache.Set(j); err != nil {
-		log.Errorf("Job %s with id %s ran, but the results couldn't be persisted: %v", j.Name, j.Id, err)
+
+	if !executed {
+		// Disabled or deleted before running: nothing changed, nothing to
+		// reschedule.
+		return false
 	}
-	j.lock.RUnlock()
-	j.lock.Lock()
+
+	// Persist before arming anything else, so a restart sees the point as
+	// consumed. The catch-up loop persists each completed point itself.
+	j.persist(cache)
+
+	if scheduled && resuming {
+		// The catch-up loop owns scheduling until the episode ends.
+		return true
+	}
 
 	if j.ShouldStartWaiting() {
-		go j.StartWaiting(cache, true)
-	} else {
-		j.IsDone = true
-
-		if j.ranChan != nil {
-			j.ranChan <- struct{}{}
-		}
+		go j.startWaiting(cache, true, false)
+		return true
 	}
 
+	j.lock.Lock()
+	j.IsDone = true
+	ran := j.ranChan != nil
 	j.lock.Unlock()
+
+	if ran {
+		j.ranChan <- struct{}{}
+	}
+	return true
 }
 
 func (j *Job) StopTimer() {
 	j.lock.Lock()
-	defer j.lock.Unlock()
+	timer := j.jobTimer
+	j.jobTimer = nil
+	j.lock.Unlock()
 
-	if j.jobTimer != nil {
-		j.jobTimer.Stop()
+	if timer != nil {
+		timer.Stop()
 	}
 }
 
@@ -566,12 +766,25 @@ func (j *Job) hasFixedRepetitions() bool {
 	return j.timesToRepeat != -1
 }
 
+// ShouldStartWaiting reports whether the job may be scheduled again.
+//
+// A fixed-repetition job is finished when its independent run counter has
+// reached the plan. The counter (Metadata.ScheduledRuns) is not truncated by
+// jobstat-ttl, unlike len(Stats).
 func (j *Job) ShouldStartWaiting() bool {
+	j.lock.RLock()
+	defer j.lock.RUnlock()
+	return j.shouldStartWaitingLocked()
+}
+
+// shouldStartWaitingLocked is ShouldStartWaiting for callers that already hold
+// the lock.
+func (j *Job) shouldStartWaitingLocked() bool {
 	if j.Disabled {
 		return false
 	}
 
-	if j.hasFixedRepetitions() && int(j.timesToRepeat) < len(j.Stats) {
+	if j.hasFixedRepetitions() && j.remainingPlanRunsLocked() <= 0 {
 		return false
 	}
 	return true

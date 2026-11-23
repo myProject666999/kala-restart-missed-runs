@@ -252,6 +252,65 @@ Examples:
 
 * [Wikipedia's Article](https://en.wikipedia.org/wiki/ISO_8601)
 
+## Missed runs after downtime or while disabled
+
+When Kala starts, or a disabled job is re-enabled, some scheduled points may
+already have passed. `missed_run_policy` decides what happens to them. The
+fields are additive, and old stored jobs without them keep the previous
+behavior.
+
+| Field | Values | Default |
+| --- | --- | --- |
+| `missed_run_policy` | `""` (legacy), `"none"`, `"catch_up"` | `""` |
+| `max_missed_runs` | integer cap for `"catch_up"` | `1` when `"catch_up"` is set |
+| `resume_at_next_scheduled_time` | legacy boolean | `false` |
+
+Policy rules:
+
+* `""` (legacy) — same as `resume_at_next_scheduled_time`: when that flag is
+  `false`, one missed run is caught up; when it is `true`, nothing is.
+* `"none"` — never catch up. The job waits for the next future grid point.
+* `"catch_up"` — catch up missed points, oldest first, up to `max_missed_runs`
+  (at least 1). A point that is still ahead of `now` is scheduled normally.
+
+An explicitly set `missed_run_policy` always wins over
+`resume_at_next_scheduled_time`; set the boolean only for legacy clients.
+
+Recovery details:
+
+* Compensation is bounded per episode. A one-minute job stopped for a week
+  missed about 10,000 points; with the default it runs **once**, with
+  `max_missed_runs: 10` it runs **ten** times, then the schedule returns to the
+  original grid (next whole minute), not "one interval after the last catch-up".
+* Completed points are persisted after every run (`last_scheduled_run_point`).
+  A crash during recovery continues the remaining budget; it does not recompute
+  the whole outage.
+* Recovery is **at-least-once**, not exactly-once: if the process dies before a
+  point's metadata is persisted (for example with `--no-tx-persist`), that point
+  may run again on the next start.
+* Manual starts (`/job/start/{id}/`) and dependency-triggered runs never consume
+  the schedule's repetition budget and never advance the schedule point.
+* `metadata.scheduled_runs` is an independent run counter, so `--jobstat-ttl`
+  truncating `stats` cannot make a finite job run again.
+* A child job **without** its own schedule is loaded but never armed; it runs
+  only when a parent finishes. A job that has **both** a schedule and a parent
+  is armed from its schedule and can also be triggered by the dependency; the
+  two sources stay independent (a dependency run never advances the schedule
+  point or consumes the repetition budget).
+* A disabled job is loaded and visible through the API but not scheduled;
+  enabling it arms (or catches up) from the job's state instead of requiring a
+  timer to have survived the restart.
+* A one-off job (no schedule) is resumed only when there is no evidence it ever
+  ran. Stored jobs with any completion evidence are not re-run.
+* `metadata.last_catch_up_result` records the latest episode only
+  (`missed_points`, `planned`, `executed`, `truncated`,
+  `next_scheduled_point`); it is replaced, never appended.
+
+Storage backends now isolate a bad stored entry: the remaining jobs load, the
+bad ones are counted, and `GET /api/v1/stats/` reports `load_failed_jobs`. A
+whole-backend read failure is still reported explicitly (`failed` is negative in
+the startup log) rather than looking like "zero bad jobs".
+
 ## Overview of routes
 
 | Task | Method | Route |

@@ -157,6 +157,17 @@ var serveCmd = &cobra.Command{
 
 		// Startup cache
 		cache.Start(time.Duration(persistEvery)*time.Second, time.Duration(viper.GetInt("jobstat-ttl"))*time.Minute)
+		if provider, ok := interface{}(cache).(job.LoadStatsProvider); ok {
+			r := provider.LoadReport()
+			if r.ReadError != nil {
+				log.Errorf("Startup load failed: %v (no jobs were loaded)", r.ReadError)
+			} else {
+				log.Infof(
+					"Startup load summary: loaded=%d timers=%d skipped=%d failed=%d catch-up runs=%d",
+					r.Loaded, r.Timers, r.Skipped, r.Failed, r.Compensated,
+				)
+			}
+		}
 
 		// Launch API server
 		log.Infof("Starting server on port %s", connectionString)

@@ -206,10 +206,15 @@ type fixedDB struct {
 
 func (f *fixedDB) GetAll() ([]*Job, error) { return f.jobs, nil }
 
-// A job stored as disabled and loaded after a restart. Enabling it
-// does nothing: no timer is armed, so it never runs.
-func TestV1EnableAfterRestartDoesNotArmTrigger(t *testing.T) {
-	// A start time shortly in the past, as it would be after a restart.
+// A job stored as disabled and loaded after a restart.
+//
+// v1 did nothing on Enable: it only restarted a job that still had a timer,
+// and a job loaded disabled has none. The fix arms the schedule from the job's
+// state instead, so this test now asserts the corrected behavior (it used to
+// record "no timer is armed"). The note is kept because v1's real-clock result
+// was 0 runs after the restart, against 3 for a no-restart control.
+func TestV1EnableAfterRestartArmsTrigger(t *testing.T) {
+	// A start time in the past, as it would be after a restart.
 	j := loadedJob(t, "R/"+rfc3339Ago(time.Minute)+"/PT1H")
 	j.Disabled = true
 
@@ -221,16 +226,19 @@ func TestV1EnableAfterRestartDoesNotArmTrigger(t *testing.T) {
 	cache := NewLockFreeJobCache(db)
 	// Note: Start also registers a signal handler goroutine that lives until
 	// the test process ends (on SIGINT it exits 0). Accepted for this test; it
-	// is the only way to run v1's real load path.
+	// is the only way to run the real load path.
 	cache.Start(0, 0)
 
 	assert.Nil(t, j.jobTimer, "a disabled job is loaded without a timer")
 	require.NoError(t, cache.Enable(j))
 
 	assert.False(t, j.Disabled, "Enable clears the flag")
-	assert.Nil(t, j.jobTimer, "but Enable arms nothing: it only restarts a job that already has a timer")
-	assert.True(t, j.NextRunAt.Equal(stale), "and the stale next-run time is left as it was")
-	// Note: enabling should arm the next trigger, but v1 does not for a job
-	// loaded disabled at startup. The real-clock result was 0 runs after the
-	// restart, against 3 for a no-restart control.
+	require.Eventually(t, func() bool {
+		j.lock.RLock()
+		defer j.lock.RUnlock()
+		return j.jobTimer != nil
+	}, time.Second, 10*time.Millisecond, "Enable now arms the next trigger from the job's state")
+	j.lock.RLock()
+	assert.True(t, j.NextRunAt.After(stale), "the stale next-run time is replaced")
+	j.lock.RUnlock()
 }

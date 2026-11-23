@@ -16,6 +16,10 @@ type KalaStats struct {
 	NextRunAt        time.Time `json:"next_run_at"`
 	LastAttemptedRun time.Time `json:"last_attempted_run"`
 
+	// LoadFailedJobs is how many stored jobs could not be loaded at the last
+	// Start. The field is additive: older clients ignore it.
+	LoadFailedJobs int `json:"load_failed_jobs"`
+
 	CreatedAt time.Time `json:"created"`
 }
 
@@ -23,6 +27,15 @@ type KalaStats struct {
 func NewKalaStats(cache JobCache) *KalaStats {
 	ks := &KalaStats{
 		CreatedAt: time.Now(),
+	}
+	if provider, ok := cache.(LoadStatsProvider); ok {
+		r := provider.LoadReport()
+		// A whole-backend read failure is not surfaced here as a count: it
+		// is reported explicitly at Start (log) and must not look like zero
+		// bad jobs. Only per-entry failures are counted.
+		if r.ReadError == nil && r.Failed > 0 {
+			ks.LoadFailedJobs = r.Failed
+		}
 	}
 	jobs := cache.GetAll()
 	jobs.Lock.RLock()
@@ -77,6 +90,13 @@ type JobStat struct {
 	NumberOfRetries   uint          `json:"number_of_retries"`
 	Success           bool          `json:"success"`
 	ExecutionDuration time.Duration `json:"execution_duration"`
+	// Trigger distinguishes a normal scheduled run from a compensating
+	// catch-up run. Empty for legacy entries and for triggers that did not
+	// exist before this field.
+	Trigger RunTrigger `json:"trigger,omitempty"`
+	// ScheduledPoint is the schedule point a schedule-driven run consumed.
+	// Zero for runs that were not caused by the schedule.
+	ScheduledPoint time.Time `json:"scheduled_point,omitempty"`
 }
 
 func NewJobStat(id string) *JobStat {

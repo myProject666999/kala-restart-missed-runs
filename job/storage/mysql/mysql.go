@@ -44,6 +44,9 @@ func New(dsn string, tlsConfig *tls.Config) *DB {
 }
 
 // GetAll returns all persisted Jobs.
+//
+// A row that cannot be decoded is skipped and summarized in a
+// *job.JobsPartiallyLoadedError instead of aborting the whole read.
 func (d DB) GetAll() ([]*job.Job, error) {
 	query := fmt.Sprintf(`select job from %[1]s;`, TableName)
 	var results []sql.NullString
@@ -51,22 +54,28 @@ func (d DB) GetAll() ([]*job.Job, error) {
 	if err != nil && err != sql.ErrNoRows {
 		return nil, err
 	}
-	err = nil
 	jobs := make([]*job.Job, 0, len(results))
+	failures := make([]job.JobLoadFailure, 0)
 	for _, v := range results {
-		if v.Valid {
-			j := job.Job{}
-			if err = json.Unmarshal([]byte(v.String), &j); err != nil {
-				break
-			}
-			if err = j.InitDelayDuration(false); err != nil {
-				break
-			}
-			jobs = append(jobs, &j)
+		if !v.Valid {
+			continue
 		}
+		j := job.Job{}
+		if err := json.Unmarshal([]byte(v.String), &j); err != nil {
+			failures = append(failures, job.JobLoadFailure{Id: j.Id, Err: err})
+			continue
+		}
+		if err := j.InitDelayDuration(false); err != nil {
+			failures = append(failures, job.JobLoadFailure{Id: j.Id, Err: err})
+			continue
+		}
+		jobs = append(jobs, &j)
 	}
 
-	return jobs, err
+	if len(failures) > 0 {
+		return jobs, &job.JobsPartiallyLoadedError{Jobs: jobs, Failures: failures}
+	}
+	return jobs, nil
 }
 
 // Get returns a persisted Job.

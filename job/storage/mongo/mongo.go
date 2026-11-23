@@ -1,6 +1,8 @@
 package mongo
 
 import (
+	"fmt"
+
 	"github.com/ajvb/kala/job"
 
 	log "github.com/sirupsen/logrus"
@@ -46,11 +48,32 @@ func New(addrs string, cred *mgo.Credential) *DB {
 }
 
 // GetAll returns all persisted Jobs.
+//
+// Jobs whose stored schedule cannot be initialized are skipped and summarized
+// in a *job.JobsPartiallyLoadedError instead of failing the whole read.
 func (d DB) GetAll() ([]*job.Job, error) {
-	jobs := []*job.Job{}
-	err := d.collection.Find(bson.M{}).All(&jobs)
+	loaded := []*job.Job{}
+	err := d.collection.Find(bson.M{}).All(&loaded)
 	if err != nil {
-		return jobs, err
+		return loaded, err
+	}
+
+	jobs := make([]*job.Job, 0, len(loaded))
+	failures := make([]job.JobLoadFailure, 0)
+	for _, j := range loaded {
+		if j == nil {
+			failures = append(failures, job.JobLoadFailure{Err: fmt.Errorf("nil job document")})
+			continue
+		}
+		if err := j.InitDelayDuration(false); err != nil {
+			failures = append(failures, job.JobLoadFailure{Id: j.Id, Err: err})
+			continue
+		}
+		jobs = append(jobs, j)
+	}
+
+	if len(failures) > 0 {
+		return jobs, &job.JobsPartiallyLoadedError{Jobs: jobs, Failures: failures}
 	}
 	return jobs, nil
 }

@@ -24,6 +24,12 @@ type JobRunner struct {
 	numberOfAttempts uint
 	currentRetries   uint
 	currentStat      *JobStat
+
+	// trigger and scheduledPoint describe what caused this run. They are
+	// copied into the JobStat so normal and compensating runs are
+	// distinguishable.
+	trigger        RunTrigger
+	scheduledPoint time.Time
 }
 
 var (
@@ -110,7 +116,7 @@ func (j *JobRunner) Run(cache JobCache) (*JobStat, Metadata, error) {
 			if err != nil {
 				log.Errorf("Error retrieving dependent job with id of %s", id)
 			} else {
-				newJob.Run(cache)
+				newJob.run(cache, TriggerDependency, time.Time{}, false)
 			}
 		}
 	}
@@ -264,6 +270,8 @@ func (j *JobRunner) shouldRetry() bool {
 func (j *JobRunner) runSetup() {
 	// Setup Job Stat
 	j.currentStat = NewJobStat(j.job.Id)
+	j.currentStat.Trigger = j.trigger
+	j.currentStat.ScheduledPoint = j.scheduledPoint
 
 	// Init retries
 	j.currentRetries = j.job.Retries
@@ -276,15 +284,15 @@ func (j *JobRunner) collectStats(success bool) {
 }
 
 func (j *JobRunner) checkExpected(statusCode int) bool {
-	// j.job.lock.Lock()
-	// defer j.job.lock.Unlock()
-
-	// If no expected response codes passed, add 200 status code as expected
-	if len(j.job.RemoteProperties.ExpectedResponseCodes) == 0 {
-		j.job.RemoteProperties.ExpectedResponseCodes = append(j.job.RemoteProperties.ExpectedResponseCodes, HTTP_CODE_OK)
+	// If no expected response codes were configured, 200 is the default.
+	// Do not append to the shared slice: concurrent runs hold only a read
+	// lock and mutating it would race.
+	expected := j.job.RemoteProperties.ExpectedResponseCodes
+	if len(expected) == 0 {
+		return statusCode == HTTP_CODE_OK
 	}
-	for _, expected := range j.job.RemoteProperties.ExpectedResponseCodes {
-		if expected == statusCode {
+	for _, code := range expected {
+		if code == statusCode {
 			return true
 		}
 	}
@@ -303,17 +311,20 @@ func (j *JobRunner) responseTimeout() time.Duration {
 	return time.Duration(responseTimeout) * time.Second
 }
 
-// setHeaders sets default and user specific headers to the http request
+// setHeaders sets default and user specific headers on the request.
+//
+// It must not mutate j.job.RemoteProperties.Headers: concurrent runs (a timer
+// and a manual start, or a catch-up run) hold only a read lock, and writing to
+// the shared map from two senders is a fatal "concurrent map writes". A copy is
+// used instead.
 func (j *JobRunner) setHeaders(req *http.Request) {
-	// j.job.lock.Lock()
-	// defer j.job.lock.Unlock()
-
-	if j.job.RemoteProperties.Headers == nil {
-		j.job.RemoteProperties.Headers = http.Header{}
+	headers := make(http.Header, len(j.job.RemoteProperties.Headers)+1)
+	for k, v := range j.job.RemoteProperties.Headers {
+		headers[k] = v
 	}
 	// A valid assumption is that the user is sending something in json cause we're past 2017
-	if j.job.RemoteProperties.Headers["Content-Type"] == nil {
-		j.job.RemoteProperties.Headers["Content-Type"] = []string{"application/json"}
+	if headers["Content-Type"] == nil {
+		headers["Content-Type"] = []string{"application/json"}
 	}
-	req.Header = j.job.RemoteProperties.Headers
+	req.Header = headers
 }

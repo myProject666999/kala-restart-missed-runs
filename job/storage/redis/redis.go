@@ -1,6 +1,8 @@
 package redis
 
 import (
+	"errors"
+
 	"github.com/ajvb/kala/job"
 
 	"github.com/garyburd/redigo/redis"
@@ -38,8 +40,12 @@ func New(address string, password redis.DialOption, sendPassword bool) *DB {
 }
 
 // GetAll returns all persisted Jobs.
+//
+// One bad entry no longer aborts the whole read; it is summarized in a
+// *job.JobsPartiallyLoadedError together with the jobs that did load.
 func (d DB) GetAll() ([]*job.Job, error) {
 	jobs := []*job.Job{}
+	failures := make([]job.JobLoadFailure, 0)
 
 	vals, err := d.conn.Do("HVALS", HashKey)
 	if err != nil {
@@ -47,19 +53,28 @@ func (d DB) GetAll() ([]*job.Job, error) {
 	}
 
 	for _, val := range vals.([]interface{}) {
-		j, err := job.NewFromBytes(val.([]byte))
-		if err != nil {
-			return nil, err
+		raw, ok := val.([]byte)
+		if !ok {
+			failures = append(failures, job.JobLoadFailure{Err: errors.New("unexpected redis value type")})
+			continue
 		}
-
+		j, err := job.NewFromBytes(raw)
+		if err != nil {
+			failures = append(failures, job.JobLoadFailure{Err: err})
+			continue
+		}
 		err = j.InitDelayDuration(false)
 		if err != nil {
-			return nil, err
+			failures = append(failures, job.JobLoadFailure{Id: j.Id, Err: err})
+			continue
 		}
 
 		jobs = append(jobs, j)
 	}
 
+	if len(failures) > 0 {
+		return jobs, &job.JobsPartiallyLoadedError{Jobs: jobs, Failures: failures}
+	}
 	return jobs, nil
 }
 

@@ -42,8 +42,16 @@ func (db *BoltJobDB) Close() error {
 	return db.dbConn.Close()
 }
 
+// GetAll returns all persisted Jobs.
+//
+// A single entry that cannot be decoded or parsed no longer aborts the whole
+// read (v1 returned the error, and the caller called log.Fatal). Bad entries are
+// skipped and summarized in a *job.JobsPartiallyLoadedError together with the
+// jobs that did load. A failure to read the bucket itself is still returned as a
+// whole-backend error.
 func (db *BoltJobDB) GetAll() ([]*job.Job, error) {
 	allJobs := []*job.Job{}
+	failures := make([]job.JobLoadFailure, 0)
 
 	err := db.dbConn.Update(func(tx *bolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists(jobBucket)
@@ -51,31 +59,38 @@ func (db *BoltJobDB) GetAll() ([]*job.Job, error) {
 			return err
 		}
 
-		err = bucket.ForEach(func(k, v []byte) error {
-			buffer := bytes.NewBuffer(v)
-			dec := gob.NewDecoder(buffer)
-			j := new(job.Job)
-			err = dec.Decode(j)
-
+		return bucket.ForEach(func(k, v []byte) error {
+			j, err := decodeJob(v)
 			if err != nil {
-				return err
+				failures = append(failures, job.JobLoadFailure{Id: string(k), Err: err})
+				return nil
 			}
-
-			err = j.InitDelayDuration(false)
-
-			if err != nil {
-				return err
-			}
-
 			allJobs = append(allJobs, j)
-
 			return nil
 		})
-
-		return err
 	})
+	if err != nil {
+		return nil, err
+	}
+	if len(failures) > 0 {
+		return allJobs, &job.JobsPartiallyLoadedError{Jobs: allJobs, Failures: failures}
+	}
 
-	return allJobs, err
+	return allJobs, nil
+}
+
+// decodeJob decodes one stored job and initializes its parsed schedule fields.
+func decodeJob(v []byte) (*job.Job, error) {
+	buffer := bytes.NewBuffer(v)
+	dec := gob.NewDecoder(buffer)
+	j := new(job.Job)
+	if err := dec.Decode(j); err != nil {
+		return nil, err
+	}
+	if err := j.InitDelayDuration(false); err != nil {
+		return nil, err
+	}
+	return j, nil
 }
 
 func (db *BoltJobDB) Get(id string) (*job.Job, error) {

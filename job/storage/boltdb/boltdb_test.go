@@ -1,12 +1,15 @@
 package boltdb
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/ajvb/kala/job"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 )
 
 var testDbPath = ""
@@ -23,6 +26,31 @@ func setupTest(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
+	// Remove any corrupt entries a test may have written, so they do not
+	// leak into later tests sharing the same database file.
+	if err := db.dbConn.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(jobBucket)
+		if bucket == nil {
+			return nil
+		}
+		var keys [][]byte
+		if err := bucket.ForEach(func(k, _ []byte) error {
+			kk := make([]byte, len(k))
+			copy(kk, k)
+			keys = append(keys, kk)
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, k := range keys {
+			if err := bucket.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestSaveAndGetJob(t *testing.T) {
@@ -100,4 +128,41 @@ func TestSaveAndGetAllJobs(t *testing.T) {
 	jobs, err := db.GetAll()
 	assert.Nil(t, err)
 	assert.Equal(t, len(jobs), 2)
+}
+
+// TestGetAllIsolatesBadEntry verifies that one undecodable stored entry does
+// not abort the whole read: the good jobs load, the bad one is summarized in a
+// *job.JobsPartiallyLoadedError, and GetAll does not claim zero failures.
+func TestGetAllIsolatesBadEntry(t *testing.T) {
+	setupTest(t)
+
+	db := GetBoltDB(testDbPath)
+	defer db.Close()
+
+	good := job.GetMockJobWithGenericSchedule(time.Now())
+	good.Id = "good-entry"
+	// The job does not need a live cache just to be saved.
+	if err := db.Save(good); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a deliberately corrupt record directly into the bucket.
+	if err := db.dbConn.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists(jobBucket)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte("bad-entry"), []byte("this is not gob"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := db.GetAll()
+	var partial *job.JobsPartiallyLoadedError
+	if !errors.As(err, &partial) {
+		t.Fatalf("expected a partial-load error, got %v", err)
+	}
+	assert.Equal(t, 1, len(jobs), "the good job still loads")
+	require.Len(t, partial.Failures, 1)
+	assert.Equal(t, "bad-entry", partial.Failures[0].Id)
 }

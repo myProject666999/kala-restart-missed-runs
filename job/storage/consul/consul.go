@@ -38,30 +38,38 @@ func (db *ConsulJobDB) Close() error {
 	return nil
 }
 
+// GetAll returns all persisted Jobs.
+//
+// A bad entry is skipped and summarized in a *job.JobsPartiallyLoadedError
+// instead of being silently dropped (v1 did that via `continue`, so failures
+// were invisible) or aborting the read.
 func (db *ConsulJobDB) GetAll() ([]*job.Job, error) {
 	allJobs := []*job.Job{}
+	failures := make([]job.JobLoadFailure, 0)
 
 	pairs, _, err := db.conn.List(prefix, &api.QueryOptions{RequireConsistent: true})
 	if err != nil {
 		return allJobs, err
 	}
 	for _, pair := range pairs {
-
 		buffer := bytes.NewBuffer(pair.Value)
 		dec := json.NewDecoder(buffer)
 		j := new(job.Job)
-		err = dec.Decode(j)
-		if err != nil {
+		if err := dec.Decode(j); err != nil {
+			failures = append(failures, job.JobLoadFailure{Id: pair.Key, Err: err})
 			continue
 		}
-		err = j.InitDelayDuration(false)
-		if err != nil {
+		if err := j.InitDelayDuration(false); err != nil {
+			failures = append(failures, job.JobLoadFailure{Id: j.Id, Err: err})
 			continue
 		}
 		allJobs = append(allJobs, j)
 	}
 
-	return allJobs, err
+	if len(failures) > 0 {
+		return allJobs, &job.JobsPartiallyLoadedError{Jobs: allJobs, Failures: failures}
+	}
+	return allJobs, nil
 }
 
 func (db *ConsulJobDB) Get(id string) (*job.Job, error) {

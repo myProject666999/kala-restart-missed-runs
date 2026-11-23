@@ -32,6 +32,9 @@ func New(dsn string) *DB {
 }
 
 // GetAll returns all persisted Jobs.
+//
+// One bad row no longer aborts the whole read; it is summarized in a
+// *job.JobsPartiallyLoadedError together with the jobs that did load.
 func (d DB) GetAll() ([]*job.Job, error) {
 	query := fmt.Sprintf(`select coalesce(json_agg(j.job), '[]'::json) from (select * from %[1]s) as j;`, TABLE_NAME)
 
@@ -40,21 +43,31 @@ func (d DB) GetAll() ([]*job.Job, error) {
 	if err != nil && err != sql.ErrNoRows {
 		return nil, err
 	}
-	err = nil
 	jobs := []*job.Job{}
 	if r.Valid {
-		err = json.Unmarshal([]byte(r.String), &jobs)
+		if err := json.Unmarshal([]byte(r.String), &jobs); err != nil {
+			return nil, err
+		}
 	}
 
 	jobsInitiated := []*job.Job{}
+	failures := make([]job.JobLoadFailure, 0)
 	for _, j := range jobs {
-		if err = j.InitDelayDuration(false); err != nil {
-			break
+		if err := j.InitDelayDuration(false); err != nil {
+			id := ""
+			if j != nil {
+				id = j.Id
+			}
+			failures = append(failures, job.JobLoadFailure{Id: id, Err: err})
+			continue
 		}
 		jobsInitiated = append(jobsInitiated, j)
 	}
 
-	return jobsInitiated, err
+	if len(failures) > 0 {
+		return jobsInitiated, &job.JobsPartiallyLoadedError{Jobs: jobsInitiated, Failures: failures}
+	}
+	return jobsInitiated, nil
 }
 
 // Get returns a persisted Job.
